@@ -10,8 +10,8 @@ class SmartColorMatch:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image_ref": ("IMAGE",),  # 原图
-                "image_gen": ("IMAGE",),  # 生成图
+                "image_ref": ("IMAGE",),  # 原图 (参考图)
+                "image_gen": ("IMAGE",),  # 生成图 (目标图)
                 "method": (["mkl_neutral", "reinhard_lab"],), # 算法选择
                 "blend_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
@@ -26,6 +26,10 @@ class SmartColorMatch:
 
     def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
         # 1. ComfyUI 的图片是 Tensor [B, H, W, C] 范围 0-1，转为 Numpy [H, W, C] 范围 0-255
+        # 这里默认处理 Batch 中的第一张图片，如果需要处理 Batch，需要外层循环
+        if image_ref.shape[0] > 1 or image_gen.shape[0] > 1:
+            print("SmartColorMatch: Warning - Only processing the first image in the batch.")
+
         ref_np = (image_ref[0].cpu().numpy() * 255).astype(np.uint8)
         gen_np = (image_gen[0].cpu().numpy() * 255).astype(np.uint8)
 
@@ -36,16 +40,16 @@ class SmartColorMatch:
         # 2. 处理 Mask
         # 如果传入了 mask，mask 为 1 的地方是衣服（变化的），我们要忽略它，只取 mask 为 0 的地方（背景）
         # ComfyUI Mask 通常是 [B, H, W] 或 [H, W]
-        valid_mask = None
+        valid_pixels_bool = None
         if ignore_mask is not None:
             mask_np = ignore_mask.cpu().numpy()
             if mask_np.ndim == 3: mask_np = mask_np[0] # 取第一帧
+            
             # Resize mask to image size
             mask_np = cv2.resize(mask_np, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_NEAREST)
             
             # 我们需要的是背景（mask < 0.5 的地方），生成一个布尔索引
             # ignore_mask: 1=Clothes(Ignore), 0=Background(Keep)
-            # 我们需要计算 stats 的区域是 mask < 0.5
             valid_pixels_bool = mask_np < 0.5
         else:
             # 如果没 mask，就用全图计算（回退到普通模式）
@@ -63,8 +67,8 @@ class SmartColorMatch:
         # 如果 mask 覆盖了全图，导致没有有效像素，防报错
         if len(ref_valid) == 0 or len(gen_valid) == 0:
             print("Warning: Mask covers entire image, using global stats.")
-            ref_valid = ref_lab
-            gen_valid = gen_lab
+            ref_valid = ref_lab.reshape(-1, 3)
+            gen_valid = gen_lab.reshape(-1, 3)
 
         # 计算统计量 (Mean, Std)
         # l, a, b
@@ -74,29 +78,17 @@ class SmartColorMatch:
         g_mean = np.mean(gen_valid, axis=0)
         g_std  = np.std(gen_valid, axis=0) + 1e-5
 
-        # 5. 应用颜色迁移到【全图】 (即使是衣服区域也要应用这个色偏修正)
-        # 这样背景修正了，衣服也会跟着修正色温，融合更自然
-        
+        # 5. 应用颜色迁移到【全图】
         res_lab = gen_lab.copy()
 
         if method == "reinhard_lab":
-            # Reinhard 算法: (x - mean_src) * (std_trg / std_src) + mean_trg
-            # 只修正 A 和 B 通道 (色相/饱和度)，保留 L 通道 (亮度/光影)
-            # 除非你想连亮度也统一，否则建议只做 idx 1 和 2
-            
-            # 这里我做一个优化：亮度通道通常不需要完全匹配 Std，只需匹配 Mean (白平衡) 
-            # 或者完全保留生成图的 L (更安全)
-            # 针对你的需求“整体一致”，建议修正 A/B 通道，L 通道保持原样或微调
-            
+            # Reinhard 算法: 只修正 A 和 B 通道 (色相/饱和度)，保留 L 通道 (亮度/光影)
             for i in [1, 2]: # 1=A, 2=B
                 res_lab[:,:,i] = (gen_lab[:,:,i] - g_mean[i]) * (r_std[i] / g_std[i]) + r_mean[i]
-            
-            # L 通道通常不动，或者只进行非常微弱的直方图对齐，这里为了换装光影自然，不动 L
-            # res_lab[:,:,0] = gen_lab[:,:,0] 
+            # L 通道不动，保留生成图的光影
 
         elif method == "mkl_neutral":
-            # 另一种算法，仅对齐均值（White Balance），不拉伸对比度
-            # 这种方法对于色差修复非常稳，不会产生怪异的饱和度
+            # 仅对齐均值（White Balance），不拉伸对比度
             for i in [1, 2]:
                 res_lab[:,:,i] = (gen_lab[:,:,i] - g_mean[i]) + r_mean[i]
 
@@ -113,6 +105,7 @@ class SmartColorMatch:
 
         return (img_out,)
 
+# 节点映射
 NODE_CLASS_MAPPINGS = {
     "SmartColorMatch": SmartColorMatch
 }
