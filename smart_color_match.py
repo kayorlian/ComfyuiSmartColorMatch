@@ -28,43 +28,31 @@ class SmartColorMatch:
     # 使用 inference_mode 避免 PyTorch 记录梯度，进一步节省显存/内存
     @torch.inference_mode()
     def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
-        # 定义变量以便 finally 块清理
+        # 初始化变量
         ref_np = gen_np = ref_lab = gen_lab = res_lab = res_rgb = final_rgb = None
         
         try:
-            # 1. 准备尺寸
-            # ComfyUI 图片格式为 [Batch, Height, Width, Channel]
             target_h, target_w = image_gen.shape[1], image_gen.shape[2]
 
-            # --- 优化核心：先在 PyTorch 里把大图缩小，不要在内存里生成巨大的 Numpy 数组 ---
-            # image_ref 是 [B, H, W, C]，PyTorch interpolate 需要 [B, C, H, W]
+            # 1. Tensor 预处理 (保持你的优秀逻辑)
             ref_tensor = image_ref[0].unsqueeze(0).permute(0, 3, 1, 2)
-            
-            # 如果原图比目标图大，先缩小
             if ref_tensor.shape[2] > target_h or ref_tensor.shape[3] > target_w:
                 ref_tensor = torch.nn.functional.interpolate(
                     ref_tensor, size=(target_h, target_w), mode="area"
                 )
-            
-            # 转回 [H, W, C] 
             ref_tensor = ref_tensor.permute(0, 2, 3, 1).squeeze(0)
             
-            # 此时 ref_tensor 已经很小了，转 Numpy 非常快且省内存
-            # 这里的 * 255 会产生临时变量，但因为尺寸小，完全没问题
+            # 转 Numpy
             ref_np = (ref_tensor.cpu().numpy() * 255).astype(np.uint8)
             gen_np = (image_gen[0].cpu().numpy() * 255).astype(np.uint8)
 
-            # 2. 处理 Mask (逻辑保持不变)
+            # 2. Mask 处理 (保持不变)
             valid_pixels_bool = None
             if ignore_mask is not None:
                 mask_np = ignore_mask.cpu().numpy()
-                if mask_np.ndim == 3:
-                    mask_np = mask_np[0]
-                
+                if mask_np.ndim == 3: mask_np = mask_np[0]
                 if mask_np.shape != (target_h, target_w):
                     mask_np = cv2.resize(mask_np, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-                
-                # < 0.5 选中背景(非Mask区域)
                 valid_pixels_bool = mask_np < 0.5
             else:
                 valid_pixels_bool = np.ones((target_h, target_w), dtype=bool)
@@ -73,11 +61,10 @@ class SmartColorMatch:
             ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
             gen_lab = cv2.cvtColor(gen_np, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-            # 4. 计算统计量
+            # 4. 统计量计算 (保持不变)
             ref_valid = ref_lab[valid_pixels_bool]
             gen_valid = gen_lab[valid_pixels_bool]
-
-            # 兜底防止除零或空
+            
             if ref_valid.size == 0 or gen_valid.size == 0:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
@@ -87,7 +74,7 @@ class SmartColorMatch:
             g_mean = np.mean(gen_valid, axis=0)
             g_std  = np.std(gen_valid, axis=0) + 1e-5
 
-            # 5. 颜色迁移计算
+            # 5. 颜色迁移
             res_lab = gen_lab.copy()
             if method == "reinhard_lab":
                 scale = r_std[1:] / g_std[1:]
@@ -100,9 +87,16 @@ class SmartColorMatch:
             res_lab = np.clip(res_lab, 0, 255).astype(np.uint8)
             res_rgb = cv2.cvtColor(res_lab, cv2.COLOR_LAB2RGB)
 
-            # 7. 混合
-            final_rgb = (res_rgb.astype(np.float32) * blend_factor + gen_np.astype(np.float32) * (1 - blend_factor))
-            final_rgb = np.clip(final_rgb, 0, 255).astype(np.uint8)
+            # 7. 混合 (优化点：使用 cv2.addWeighted 节省内存)
+            # 公式: src1 * alpha + src2 * beta + gamma
+            # blend_factor 越大，res_rgb 占比越高
+            if blend_factor >= 1.0:
+                final_rgb = res_rgb
+            elif blend_factor <= 0.0:
+                final_rgb = gen_np
+            else:
+                # 这一步比纯 Numpy 数学运算更省内存且极快
+                final_rgb = cv2.addWeighted(res_rgb, blend_factor, gen_np, 1.0 - blend_factor, 0)
 
             # 8. 输出
             img_out = torch.from_numpy(final_rgb).float() / 255.0
@@ -112,19 +106,14 @@ class SmartColorMatch:
 
         except Exception as e:
             print(f"SmartColorMatch Error: {e}")
-            # 出错时返回原图防止崩溃
             return (image_gen,)
 
         finally:
-            # --- 强制内存清理 ---
-            # 手动删除大的 Numpy 数组引用
+            # 清理引用
             del ref_np, gen_np, ref_lab, gen_lab, res_lab, res_rgb, final_rgb
-            
-            # 强制调用 Python 垃圾回收
+            # 强制 GC
             gc.collect()
-            
-            # 如果有 GPU 显存残留，也可以清一下(主要是 RAM 问题，但这行也没坏处)
-            torch.cuda.empty_cache()
+            # 移除了 torch.cuda.empty_cache() 以避免降速
 
 # 节点映射
 NODE_CLASS_MAPPINGS = {
