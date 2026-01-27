@@ -11,8 +11,8 @@ class SmartColorMatch:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image_ref": ("IMAGE",),  # 原图 (参考图) [B, H, W, C]
-                "image_gen": ("IMAGE",),  # 生成图 (目标图) [B, H, W, C]
+                "image_ref": ("IMAGE",),  # 参考图 [B, H, W, C]
+                "image_gen": ("IMAGE",),  # 生成图 [B, H, W, C]
                 "method": (["mkl_neutral", "reinhard_lab"],),
                 "blend_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
@@ -26,143 +26,124 @@ class SmartColorMatch:
     CATEGORY = "Image/Color"
 
     def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
-        # 获取 Batch 大小
         batch_size = image_gen.shape[0]
         ref_batch_size = image_ref.shape[0]
         
         out_tensors = []
 
-        # 预处理 Mask (如果存在)
+        # 预处理 Mask
         mask_np_batch = None
         if ignore_mask is not None:
-            # Mask 通常是 [B, H, W] 或 [1, H, W]
             mask_np_batch = ignore_mask.cpu().numpy()
             if mask_np_batch.ndim == 2:
-                mask_np_batch = mask_np_batch[np.newaxis, ...] # 补齐 Batch 维度
+                mask_np_batch = mask_np_batch[np.newaxis, ...]
 
         for i in range(batch_size):
-            # 1. 准备当前帧数据
-            # 如果参考图少于生成图，循环使用参考图
-            curr_ref_img = image_ref[i % ref_batch_size] 
-            curr_gen_img = image_gen[i]
+            # 1. 准备数据：保持 Float32 (0.0 - 1.0) 精度，不要转 uint8
+            curr_ref_img = image_ref[i % ref_batch_size].cpu().numpy()
+            curr_gen_img = image_gen[i].cpu().numpy()
 
-            # 转换为 Numpy (H, W, 3) uint8
-            ref_np = (curr_ref_img.cpu().numpy() * 255).astype(np.uint8)
-            gen_np = (curr_gen_img.cpu().numpy() * 255).astype(np.uint8)
-
-            # 确保尺寸一致 (调整参考图以匹配生成图)
-            if ref_np.shape[:2] != gen_np.shape[:2]:
-                ref_np = cv2.resize(ref_np, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_AREA)
+            # 确保尺寸一致 (调整参考图)
+            if curr_ref_img.shape[:2] != curr_gen_img.shape[:2]:
+                # 使用 LINEAR 缩放以保持平滑，避免产生额外的噪点
+                curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_LINEAR)
 
             # 2. 处理 Mask
             valid_pixels_bool = None
             if mask_np_batch is not None:
-                # 处理 Mask 的 Batch 广播 (如果 Mask 只有1张，应用于所有图片)
                 curr_mask = mask_np_batch[i % mask_np_batch.shape[0]]
-                
-                # 调整 Mask 尺寸
-                if curr_mask.shape != gen_np.shape[:2]:
-                    curr_mask = cv2.resize(curr_mask, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_NEAREST)
-                
-                # < 0.5 意味着选中黑色区域参与计算
+                if curr_mask.shape != curr_gen_img.shape[:2]:
+                    curr_mask = cv2.resize(curr_mask, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                # Mask 通常 1.0 是遮挡，0.0 是内容；或者反之。ComfyUI mask 0是黑，1是白。
+                # 假设 Mask 输入是 "ignore_mask" (遮挡部分)，则 < 0.5 (黑色部分) 是我们要处理的区域
                 valid_pixels_bool = curr_mask < 0.5
-            else:
-                # 即使没有 Mask，也尽量不要创建全为 True 的巨型 bool 数组，直接用 None 标记
-                valid_pixels_bool = None
 
-            # 3. 颜色空间转换 RGB -> LAB
-            ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
-            gen_lab = cv2.cvtColor(gen_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+            # 3. 颜色空间转换 RGB -> LAB (Float32)
+            # OpenCV float32 LAB 范围: L [0, 100], a [-127, 127], b [-127, 127]
+            # 这种精度比 uint8 (0-255) 高得多，能有效避免冷暖色调的色相偏移
+            ref_lab = cv2.cvtColor(curr_ref_img, cv2.COLOR_RGB2LAB)
+            gen_lab = cv2.cvtColor(curr_gen_img, cv2.COLOR_RGB2LAB)
 
             # 4. 统计量计算
-            # 提取有效像素
             if valid_pixels_bool is not None:
+                # 展平并筛选
                 ref_valid = ref_lab[valid_pixels_bool]
                 gen_valid = gen_lab[valid_pixels_bool]
             else:
-                # 使用 reshape 避免 copy，减少内存占用
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
-            # 兜底：如果 Mask 导致无像素
+            # 兜底：防止 Mask 全白导致无像素
             if ref_valid.size == 0 or gen_valid.size == 0:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
             # 计算均值和标准差
             r_mean = np.mean(ref_valid, axis=0)
-            r_std  = np.std(ref_valid, axis=0) + 1e-5
+            r_std  = np.std(ref_valid, axis=0) + 1e-6 # 增加极小值防止除零
             g_mean = np.mean(gen_valid, axis=0)
-            g_std  = np.std(gen_valid, axis=0) + 1e-5
-            
-            # 释放不再需要的统计样本内存
+            g_std  = np.std(gen_valid, axis=0) + 1e-6
+
             del ref_valid
             del gen_valid
-            # ref_lab 也不再需要了，只需要它的统计数据
             del ref_lab
 
-            # 5. 应用颜色迁移 (直接修改 gen_lab，避免创建 copy)
-            # LAB: L=0, A=1, B=2. 我们只修改 A 和 B
-            
-            l_channel = gen_lab[:, :, 0] # 引用 L 通道
-            ab_channels = gen_lab[:, :, 1:] # 引用 AB 通道
-            
+            # 5. 应用颜色迁移 (操作 a, b 通道)
+            l_channel = gen_lab[:, :, 0]
+            ab_channels = gen_lab[:, :, 1:]
+
             if method == "reinhard_lab":
+                # 计算缩放系数
                 scale = r_std[1:] / g_std[1:]
+                
+                # [关键修复]：限制饱和度放大的倍率
+                # 如果 AI 图很平滑(std小)，原图很噪(std大)，scale 会变得巨大，导致颜色过饱和(青/红偏色)
+                # 这里限制 scale 最大为 1.5 倍，最小 0.5 倍，保持相对自然
+                scale = np.clip(scale, 0.5, 1.5)
+                
                 # (X - Mean_src) * Scale + Mean_tgt
-                # 尽量使用原地操作符 -=, *=, += 减少临时内存分配
-                ab_channels -= g_mean[1:] 
+                ab_channels -= g_mean[1:]
                 ab_channels *= scale
                 ab_channels += r_mean[1:]
                 
             elif method == "mkl_neutral":
-                # (X - Mean_src) + Mean_tgt
+                # 仅迁移均值，不迁移方差 (更稳定，适合光照差异大的情况)
                 ab_channels -= g_mean[1:]
                 ab_channels += r_mean[1:]
 
-            # 将修改后的 AB 通道赋回 (其实上面的切片引用已经是 View 了，但为了保险)
+            # 赋回修改后的通道
             gen_lab[:, :, 1:] = ab_channels
 
             # 6. 转回 RGB
-            # Clip 并转 uint8
-            np.clip(gen_lab, 0, 255, out=gen_lab) # 原地 clip
-            gen_lab_uint8 = gen_lab.astype(np.uint8)
-            del gen_lab # 释放 float32 大数组
-
-            res_rgb = cv2.cvtColor(gen_lab_uint8, cv2.COLOR_LAB2RGB)
-            del gen_lab_uint8
+            # Float LAB 转回 RGB 后，值域不一定是 0-1，可能有溢出，需要 Clip
+            res_rgb = cv2.cvtColor(gen_lab, cv2.COLOR_LAB2RGB)
+            res_rgb = np.clip(res_rgb, 0.0, 1.0)
+            
+            del gen_lab
 
             # 7. 混合 (Blend)
             if blend_factor < 1.0:
-                # 转换为 float32 进行混合
-                res_rgb = res_rgb.astype(np.float32) * blend_factor + gen_np.astype(np.float32) * (1 - blend_factor)
-                np.clip(res_rgb, 0, 255, out=res_rgb)
-                res_rgb = res_rgb.astype(np.uint8)
-            
-            del gen_np # 释放原图 Numpy
+                res_rgb = res_rgb * blend_factor + curr_gen_img * (1 - blend_factor)
+                res_rgb = np.clip(res_rgb, 0.0, 1.0) # 再次确保安全
 
-            # 转 Tensor 并立即归一化，释放 Numpy 内存
-            img_tensor = torch.from_numpy(res_rgb).float() / 255.0
+            # 转 Tensor
+            img_tensor = torch.from_numpy(res_rgb)
             out_tensors.append(img_tensor)
             
             del res_rgb
-            
-            # 手动触发 GC 并不是必须的，但在处理极大图片 Batch 时可以防止峰值过高
-            # gc.collect() 
+            del curr_gen_img
 
-        # 拼接 Batch: [B, H, W, C]
         if len(out_tensors) > 0:
             final_output = torch.stack(out_tensors, dim=0)
         else:
-            final_output = image_gen # 兜底
+            final_output = image_gen
 
         return (final_output,)
 
-# 节点映射
 NODE_CLASS_MAPPINGS = {
     "SmartColorMatch": SmartColorMatch
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SmartColorMatch": "Smart Color Match (Masked)"
+    "SmartColorMatch": "Smart Color Match (Fixed)"
 }
