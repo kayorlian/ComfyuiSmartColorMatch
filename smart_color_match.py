@@ -88,28 +88,33 @@ class SmartColorMatch:
             del gen_valid
             del ref_lab
 
-            # 5. 应用颜色迁移 (操作 a, b 通道)
+# 5. 应用颜色迁移 (操作 a, b 通道)
             l_channel = gen_lab[:, :, 0]
             ab_channels = gen_lab[:, :, 1:]
+
+            # 计算参考图和生成图的均值差（需要移动的颜色向量）
+            mean_shift = r_mean[1:] - g_mean[1:]
+            
+            # [核心修复]：限制均值偏移的最大幅度
+            # 衣服的色差校正通常是微调，如果偏移量过大，说明 Mask 抓取到了皮肤或背景
+            # 在 LAB 空间中，色相偏移超过 15 已经是非常剧烈的变化，这里我们强制锁死最大偏移量
+            max_shift = 15.0 
+            mean_shift = np.clip(mean_shift, -max_shift, max_shift)
 
             if method == "reinhard_lab":
                 # 计算缩放系数
                 scale = r_std[1:] / g_std[1:]
-                
-                # [关键修复]：限制饱和度放大的倍率
-                # 如果 AI 图很平滑(std小)，原图很噪(std大)，scale 会变得巨大，导致颜色过饱和(青/红偏色)
-                # 这里限制 scale 最大为 1.5 倍，最小 0.5 倍，保持相对自然
                 scale = np.clip(scale, 0.5, 1.5)
                 
-                # (X - Mean_src) * Scale + Mean_tgt
+                # 使用限制后的 mean_shift 进行迁移
+                # 数学等价于： (X - g_mean) * scale + (g_mean + mean_shift)
                 ab_channels -= g_mean[1:]
                 ab_channels *= scale
-                ab_channels += r_mean[1:]
+                ab_channels += (g_mean[1:] + mean_shift)
                 
             elif method == "mkl_neutral":
-                # 仅迁移均值，不迁移方差 (更稳定，适合光照差异大的情况)
-                ab_channels -= g_mean[1:]
-                ab_channels += r_mean[1:]
+                # 仅迁移均值，同样使用限制后的偏移量
+                ab_channels += mean_shift
 
             # 赋回修改后的通道
             gen_lab[:, :, 1:] = ab_channels
