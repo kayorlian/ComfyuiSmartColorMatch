@@ -78,17 +78,20 @@ class SmartColorMatch:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
-            # 计算均值和标准差
-            r_mean = np.mean(ref_valid, axis=0)
-            r_std  = np.std(ref_valid, axis=0) + 1e-6 # 增加极小值防止除零
-            g_mean = np.mean(gen_valid, axis=0)
+            # [核心修复]：使用 np.median (中位数) 替代 np.mean (均值)
+            # 中位数能完美锁定占据面积最大的“衣服底色”，自动无视蓝色的图案、字母以及边缘的皮肤
+            r_mean = np.median(ref_valid, axis=0)
+            g_mean = np.median(gen_valid, axis=0)
+            
+            # 方差保持使用 std（用于 reinhard 算法的对比度缩放）
+            r_std  = np.std(ref_valid, axis=0) + 1e-6 
             g_std  = np.std(gen_valid, axis=0) + 1e-6
 
             del ref_valid
             del gen_valid
             del ref_lab
 
-# 5. 应用颜色迁移 (操作 a, b 通道)
+            # 5. 应用颜色迁移 (操作 a, b 通道)
             l_channel = gen_lab[:, :, 0]
             ab_channels = gen_lab[:, :, 1:]
 
