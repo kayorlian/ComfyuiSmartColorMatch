@@ -40,10 +40,17 @@ class SmartColorMatch:
             curr_ref_img = image_ref[i % ref_batch_size].cpu().numpy()
             curr_gen_img = image_gen[i].cpu().numpy()
 
+            # ==========================================================
+            # [核心终极修复 1]：拦截 VAE 越界值，防止 OpenCV 计算崩溃产生 NaN 噪点
+            # ==========================================================
+            curr_ref_img = np.clip(curr_ref_img, 0.0, 1.0)
+            curr_gen_img = np.clip(curr_gen_img, 0.0, 1.0)
+
             # 使用 INTER_AREA 避免缩小产生的摩尔纹
             if curr_ref_img.shape[:2] != curr_gen_img.shape[:2]:
                 curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_AREA)
 
+            # 屏蔽遮罩逻辑（保持你原有的逻辑）
             valid_pixels_bool = None
             if mask_np_batch is not None:
                 curr_mask = mask_np_batch[i % mask_np_batch.shape[0]]
@@ -61,10 +68,12 @@ class SmartColorMatch:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
+            # 兜底：防止 mask 异常导致没有有效像素
             if ref_valid.size == 0 or gen_valid.size == 0:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
+            # 提取中位数主色调
             r_mean = np.median(ref_valid, axis=0)
             g_mean = np.median(gen_valid, axis=0)
             
@@ -74,11 +83,10 @@ class SmartColorMatch:
             l_channel = gen_lab[:, :, 0]
             ab_channels = gen_lab[:, :, 1:]
 
-            # 基础颜色偏移
+            # 基础颜色偏移限制
             mean_shift = r_mean[1:] - g_mean[1:]
             mean_shift = np.clip(mean_shift, -15.0, 15.0)
 
-            # 基础明度补偿 (全局常数平移，绝对不引入逐像素噪点)
             l_shift = r_mean[0] - g_mean[0]
             l_shift = np.clip(l_shift, -20.0, 20.0)
 
@@ -91,22 +99,26 @@ class SmartColorMatch:
                 l_channel += (l_shift * 0.5) 
                 
             elif method == "mkl_neutral":
-                # 直接全局常数相加，数学上保证100%不会产生结构性噪点
                 ab_channels += mean_shift
                 l_channel += (l_shift * 0.5) 
 
-            gen_lab[:, :, 0] = l_channel
-            gen_lab[:, :, 1:] = ab_channels
+            # ==========================================================
+            # [核心终极修复 2]：拦截 LAB 通道越界，防止 LAB2RGB 输出垃圾颜色
+            # Float32 模式下，L 必须在 0~100，ab 必须在 -127~127 之间
+            # ==========================================================
+            gen_lab[:, :, 0] = np.clip(l_channel, 0.0, 100.0)
+            gen_lab[:, :, 1] = np.clip(ab_channels[:, :, 0], -127.0, 127.0)
+            gen_lab[:, :, 2] = np.clip(ab_channels[:, :, 1], -127.0, 127.0)
 
-            # 6. 转回 RGB 并进行 色相保护映射 (Gamut Mapping)
+            # 6. 转回 RGB
             res_rgb = cv2.cvtColor(gen_lab, cv2.COLOR_LAB2RGB)
             
-            # [核心终极修复：按比例缩放防止 np.clip 破坏色相]
+            # 等比例缩放保护色相，避免生硬截断 (Gamut Mapping)
             max_c = np.max(res_rgb, axis=2, keepdims=True)
-            # 只有最大值大于1的像素，才将其RGB等比缩小，色相永远保持不变
+            max_c = np.where(max_c <= 0, 1.0, max_c) # 防止除以0或负数崩溃
             res_rgb = np.where(max_c > 1.0, res_rgb / max_c, res_rgb)
             
-            # 下限极少溢出且对画质无影响，直接 clip 即可兜底
+            # 最后安全封底
             res_rgb = np.clip(res_rgb, 0.0, 1.0)
             
             # 7. 混合 (Blend)
