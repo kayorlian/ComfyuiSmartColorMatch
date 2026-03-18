@@ -45,8 +45,8 @@ class SmartColorMatch:
 
             # 确保尺寸一致 (调整参考图)
             if curr_ref_img.shape[:2] != curr_gen_img.shape[:2]:
-                # 使用 LINEAR 缩放以保持平滑，避免产生额外的噪点
-                curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                # [优化点 1]：使用 INTER_AREA 缩放以保持平滑，避免大尺寸缩小时产生摩尔纹和采样噪点
+                curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_AREA)
 
             # 2. 处理 Mask
             valid_pixels_bool = None
@@ -78,7 +78,7 @@ class SmartColorMatch:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
-            # [核心修复]：使用 np.median (中位数) 替代 np.mean (均值)
+            # 使用 np.median (中位数) 替代 np.mean (均值)
             # 中位数能完美锁定占据面积最大的“衣服底色”，自动无视蓝色的图案、字母以及边缘的皮肤
             r_mean = np.median(ref_valid, axis=0)
             g_mean = np.median(gen_valid, axis=0)
@@ -91,35 +91,42 @@ class SmartColorMatch:
             del gen_valid
             del ref_lab
 
-            # 5. 应用颜色迁移 (操作 a, b 通道)
+            # 5. 应用颜色迁移 (操作 L, a, b 通道)
             l_channel = gen_lab[:, :, 0]
             ab_channels = gen_lab[:, :, 1:]
 
-            # 计算参考图和生成图的均值差（需要移动的颜色向量）
-            mean_shift = r_mean[1:] - g_mean[1:]
+            # [优化点 2]：分别计算 L 通道(明度)和 AB 通道(色彩)的差值
+            l_shift = r_mean[0] - g_mean[0]
+            ab_shift = r_mean[1:] - g_mean[1:]
             
-            # [核心修复]：限制均值偏移的最大幅度
-            # 衣服的色差校正通常是微调，如果偏移量过大，说明 Mask 抓取到了皮肤或背景
-            # 在 LAB 空间中，色相偏移超过 15 已经是非常剧烈的变化，这里我们强制锁死最大偏移量
-            max_shift = 15.0 
-            mean_shift = np.clip(mean_shift, -max_shift, max_shift)
+            # 限制偏移的最大幅度，防止 Mask 抓取到皮肤导致颜色崩坏
+            max_ab_shift = 15.0 
+            max_l_shift = 25.0  # L 通道可以容忍稍微大一点的调整范围
+            
+            ab_shift = np.clip(ab_shift, -max_ab_shift, max_ab_shift)
+            l_shift = np.clip(l_shift, -max_l_shift, max_l_shift)
 
             if method == "reinhard_lab":
-                # 计算缩放系数
+                # 计算缩悉数
                 scale = r_std[1:] / g_std[1:]
                 scale = np.clip(scale, 0.5, 1.5)
                 
-                # 使用限制后的 mean_shift 进行迁移
-                # 数学等价于： (X - g_mean) * scale + (g_mean + mean_shift)
+                # 色彩通道迁移
                 ab_channels -= g_mean[1:]
                 ab_channels *= scale
-                ab_channels += (g_mean[1:] + mean_shift)
+                ab_channels += (g_mean[1:] + ab_shift)
+                
+                # [优化点 3]：同步调整亮度，权重设为 0.7（保留 30% 生成图自身的光影立体感）
+                l_channel += (l_shift * 0.7)
                 
             elif method == "mkl_neutral":
-                # 仅迁移均值，同样使用限制后的偏移量
-                ab_channels += mean_shift
+                # 色彩通道迁移
+                ab_channels += ab_shift
+                # [优化点 3]：同步补偿明度以避免 RGB 转换时超限被裁剪（消除噪点）
+                l_channel += (l_shift * 0.7)
 
             # 赋回修改后的通道
+            gen_lab[:, :, 0] = l_channel
             gen_lab[:, :, 1:] = ab_channels
 
             # 6. 转回 RGB
