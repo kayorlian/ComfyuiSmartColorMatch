@@ -39,51 +39,43 @@ class SmartColorMatch:
                 mask_np_batch = mask_np_batch[np.newaxis, ...]
 
         for i in range(batch_size):
-            # 1. 准备数据：保持 Float32 (0.0 - 1.0) 精度，不要转 uint8
+            # 1. 准备数据：保持 Float32 (0.0 - 1.0) 精度
             curr_ref_img = image_ref[i % ref_batch_size].cpu().numpy()
             curr_gen_img = image_gen[i].cpu().numpy()
 
-            # 确保尺寸一致 (调整参考图)
+            # 确保尺寸一致 (使用 INTER_AREA 避免缩小产生的摩尔纹)
             if curr_ref_img.shape[:2] != curr_gen_img.shape[:2]:
-                # [优化点 1]：使用 INTER_AREA 缩放以保持平滑，避免大尺寸缩小时产生摩尔纹和采样噪点
                 curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_AREA)
 
             # 2. 处理 Mask
             valid_pixels_bool = None
+            curr_mask = None
             if mask_np_batch is not None:
                 curr_mask = mask_np_batch[i % mask_np_batch.shape[0]]
                 if curr_mask.shape != curr_gen_img.shape[:2]:
-                    curr_mask = cv2.resize(curr_mask, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_NEAREST)
-                # Mask 通常 1.0 是遮挡，0.0 是内容；或者反之。ComfyUI mask 0是黑，1是白。
-                # 假设 Mask 输入是 "ignore_mask" (遮挡部分)，则 < 0.5 (黑色部分) 是我们要处理的区域
+                    curr_mask = cv2.resize(curr_mask, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                # < 0.5 (黑色部分) 是目标衣服区域
                 valid_pixels_bool = curr_mask < 0.5
 
             # 3. 颜色空间转换 RGB -> LAB (Float32)
-            # OpenCV float32 LAB 范围: L [0, 100], a [-127, 127], b [-127, 127]
-            # 这种精度比 uint8 (0-255) 高得多，能有效避免冷暖色调的色相偏移
             ref_lab = cv2.cvtColor(curr_ref_img, cv2.COLOR_RGB2LAB)
             gen_lab = cv2.cvtColor(curr_gen_img, cv2.COLOR_RGB2LAB)
 
-            # 4. 统计量计算
+            # 4. 统计量计算 (使用中位数完美规避图案干扰)
             if valid_pixels_bool is not None:
-                # 展平并筛选
                 ref_valid = ref_lab[valid_pixels_bool]
                 gen_valid = gen_lab[valid_pixels_bool]
             else:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
-            # 兜底：防止 Mask 全白导致无像素
             if ref_valid.size == 0 or gen_valid.size == 0:
                 ref_valid = ref_lab.reshape(-1, 3)
                 gen_valid = gen_lab.reshape(-1, 3)
 
-            # 使用 np.median (中位数) 替代 np.mean (均值)
-            # 中位数能完美锁定占据面积最大的“衣服底色”，自动无视蓝色的图案、字母以及边缘的皮肤
             r_mean = np.median(ref_valid, axis=0)
             g_mean = np.median(gen_valid, axis=0)
             
-            # 方差保持使用 std（用于 reinhard 算法的对比度缩放）
             r_std  = np.std(ref_valid, axis=0) + 1e-6 
             g_std  = np.std(gen_valid, axis=0) + 1e-6
 
@@ -91,46 +83,60 @@ class SmartColorMatch:
             del gen_valid
             del ref_lab
 
-            # 5. 应用颜色迁移 (操作 L, a, b 通道)
+            # 5. 应用颜色迁移 (核心修复区)
             l_channel = gen_lab[:, :, 0]
             ab_channels = gen_lab[:, :, 1:]
 
-            # [优化点 2]：分别计算 L 通道(明度)和 AB 通道(色彩)的差值
-            l_shift = r_mean[0] - g_mean[0]
+            l_shift = float(r_mean[0] - g_mean[0])
             ab_shift = r_mean[1:] - g_mean[1:]
             
-            # 限制偏移的最大幅度，防止 Mask 抓取到皮肤导致颜色崩坏
-            max_ab_shift = 15.0 
-            max_l_shift = 25.0  # L 通道可以容忍稍微大一点的调整范围
+            # 限制全局最大偏移幅度
+            ab_shift = np.clip(ab_shift, -15.0, 15.0)
+            l_shift = np.clip(l_shift, -25.0, 25.0)
+            ab_shift_vec = ab_shift.reshape(1, 1, 2)
+
+            # --- 修复点 A：区域隔离隔离 (保护背景) ---
+            if curr_mask is not None:
+                weight_target = 1.0 - curr_mask  # 目标区域权重为1，背景为0
+            else:
+                weight_target = np.ones_like(l_channel)
+
+            # --- 修复点 B：色域容差保护 (Gamut Capacity) ---
+            # 物理法则：极亮(>80)或极暗(<20)的像素容纳不下高饱和度，强行注入会导致RGB严重溢出（即噪点根源）
+            capacity = np.ones_like(l_channel)
+            # 让高光区域渐渐失去强上色能力
+            capacity[l_channel > 80] = (100.0 - l_channel[l_channel > 80]) / 20.0
+            # 让阴影死黑区域也不吸收过量颜色
+            capacity[l_channel < 20] = l_channel[l_channel < 20] / 20.0
+            capacity = np.clip(capacity, 0.0, 1.0)
+
+            # 综合颜色权重：遮罩权重 * 色域容差权重
+            final_ab_weight = weight_target * capacity
+            final_ab_weight = final_ab_weight[..., np.newaxis] # 匹配通道维度
             
-            ab_shift = np.clip(ab_shift, -max_ab_shift, max_ab_shift)
-            l_shift = np.clip(l_shift, -max_l_shift, max_l_shift)
+            # 明度不需要色域限制，只需遮罩限制
+            final_l_weight = weight_target
 
             if method == "reinhard_lab":
-                # 计算缩悉数
                 scale = r_std[1:] / g_std[1:]
-                scale = np.clip(scale, 0.5, 1.5)
+                scale = np.clip(scale, 0.5, 1.5).reshape(1, 1, 2)
                 
-                # 色彩通道迁移
-                ab_channels -= g_mean[1:]
-                ab_channels *= scale
-                ab_channels += (g_mean[1:] + ab_shift)
+                # 计算目标颜色，并用 final_ab_weight 平滑过渡
+                target_ab = (ab_channels - g_mean[1:].reshape(1,1,2)) * scale + (g_mean[1:].reshape(1,1,2) + ab_shift_vec)
+                ab_channels = ab_channels * (1.0 - final_ab_weight) + target_ab * final_ab_weight
                 
-                # [优化点 3]：同步调整亮度，权重设为 0.7（保留 30% 生成图自身的光影立体感）
-                l_channel += (l_shift * 0.7)
+                # 同步调整亮度
+                l_channel += (l_shift * 0.7) * final_l_weight
                 
             elif method == "mkl_neutral":
-                # 色彩通道迁移
-                ab_channels += ab_shift
-                # [优化点 3]：同步补偿明度以避免 RGB 转换时超限被裁剪（消除噪点）
-                l_channel += (l_shift * 0.7)
+                # 只在目标衣服区域 + 根据高光阴影宽容度 智能加上偏移量
+                ab_channels += ab_shift_vec * final_ab_weight
+                l_channel += (l_shift * 0.7) * final_l_weight
 
-            # 赋回修改后的通道
             gen_lab[:, :, 0] = l_channel
             gen_lab[:, :, 1:] = ab_channels
 
             # 6. 转回 RGB
-            # Float LAB 转回 RGB 后，值域不一定是 0-1，可能有溢出，需要 Clip
             res_rgb = cv2.cvtColor(gen_lab, cv2.COLOR_LAB2RGB)
             res_rgb = np.clip(res_rgb, 0.0, 1.0)
             
@@ -139,9 +145,8 @@ class SmartColorMatch:
             # 7. 混合 (Blend)
             if blend_factor < 1.0:
                 res_rgb = res_rgb * blend_factor + curr_gen_img * (1 - blend_factor)
-                res_rgb = np.clip(res_rgb, 0.0, 1.0) # 再次确保安全
+                res_rgb = np.clip(res_rgb, 0.0, 1.0)
 
-            # 转 Tensor
             img_tensor = torch.from_numpy(res_rgb)
             out_tensors.append(img_tensor)
             
