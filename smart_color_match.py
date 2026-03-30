@@ -50,6 +50,12 @@ class SmartColorMatch:
             if curr_ref_img.shape[:2] != curr_gen_img.shape[:2]:
                 curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_AREA)
 
+            # ==========================================================
+            # [新增修复]：动态检测并排除参考图的黑边 (黑边通常 RGB 值接近 0)
+            # 计算 RGB 颜色之和，如果极小 (< 0.05) 则认为是黑边，不参与颜色统计
+            # ==========================================================
+            ref_non_black_mask = np.sum(curr_ref_img, axis=-1) > 0.05
+
             # 屏蔽遮罩逻辑（保持你原有的逻辑）
             valid_pixels_bool = None
             if mask_np_batch is not None:
@@ -61,11 +67,15 @@ class SmartColorMatch:
             ref_lab = cv2.cvtColor(curr_ref_img, cv2.COLOR_RGB2LAB)
             gen_lab = cv2.cvtColor(curr_gen_img, cv2.COLOR_RGB2LAB)
 
+            # 结合黑边遮罩和输入的 ignore_mask
             if valid_pixels_bool is not None:
-                ref_valid = ref_lab[valid_pixels_bool]
+                # 参考图需要同时满足 valid_pixels_bool 并且 不是黑边
+                ref_combined_mask = valid_pixels_bool & ref_non_black_mask
+                ref_valid = ref_lab[ref_combined_mask]
                 gen_valid = gen_lab[valid_pixels_bool]
             else:
-                ref_valid = ref_lab.reshape(-1, 3)
+                # 如果没有输入 ignore_mask，仅排除参考图的黑边
+                ref_valid = ref_lab[ref_non_black_mask]
                 gen_valid = gen_lab.reshape(-1, 3)
 
             # 兜底：防止 mask 异常导致没有有效像素
