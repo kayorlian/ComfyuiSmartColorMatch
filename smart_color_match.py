@@ -10,13 +10,13 @@ class SmartColorMatch:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image_ref": ("IMAGE",),  # 原图
-                "image_gen": ("IMAGE",),  # 生成图
-                "method": (["mkl_neutral", "reinhard_lab"],), # 算法选择
+                "image_ref": ("IMAGE",),  
+                "image_gen": ("IMAGE",),  
+                "method": (["mkl_neutral", "reinhard_lab"],), 
                 "blend_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
-                "ignore_mask": ("MASK",), # 衣服的蒙版（指明哪些地方不需要计算颜色统计）
+                "ignore_mask": ("MASK",), 
             }
         }
 
@@ -25,91 +25,89 @@ class SmartColorMatch:
     CATEGORY = "Image/Color"
 
     def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
-        # 1. ComfyUI 的图片是 Tensor [B, H, W, C] 范围 0-1，转为 Numpy [H, W, C] 范围 0-255
-        ref_np = (image_ref[0].cpu().numpy() * 255).astype(np.uint8)
-        gen_np = (image_gen[0].cpu().numpy() * 255).astype(np.uint8)
+        # 1. 终极修复：强制转换为标准的 float32，彻底杜绝 PyTorch 2.9+ 中的 bfloat16/float16 导致的 numpy 乱码崩溃
+        ref_tensor = image_ref.to(torch.float32).cpu()
+        gen_tensor = image_gen.to(torch.float32).cpu()
+        
+        # 确保只取第一帧 (降维提取)
+        if ref_tensor.ndim == 4: ref_tensor = ref_tensor[0]
+        if gen_tensor.ndim == 4: gen_tensor = gen_tensor[0]
 
-        # 确保尺寸一致，如果不一致，将 ref 缩放到 gen 的大小
+        # 安全转为 Numpy uint8
+        ref_np = (ref_tensor.numpy() * 255).clip(0, 255).astype(np.uint8)
+        gen_np = (gen_tensor.numpy() * 255).clip(0, 255).astype(np.uint8)
+        
+        # 终极修复 2：如果新版 ComfyUI 传来了带透明度 (RGBA) 的 4 通道图，强行丢弃 Alpha 通道，只留 RGB
+        if ref_np.shape[-1] > 3: ref_np = ref_np[..., :3]
+        if gen_np.shape[-1] > 3: gen_np = gen_np[..., :3]
+
         if ref_np.shape != gen_np.shape:
             ref_np = cv2.resize(ref_np, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_AREA)
 
         # 2. 处理 Mask
-        # 如果传入了 mask，mask 为 1 的地方是衣服（变化的），我们要忽略它，只取 mask 为 0 的地方（背景）
-        # ComfyUI Mask 通常是 [B, H, W] 或 [H, W]
         valid_mask = None
         if ignore_mask is not None:
-            mask_np = ignore_mask.cpu().numpy()
-            if mask_np.ndim == 3: mask_np = mask_np[0] # 取第一帧
-            # Resize mask to image size
+            # 同样强制 float32，保住 Mask 的数据纯洁性
+            mask_tensor = ignore_mask.to(torch.float32).cpu()
+            mask_np = mask_tensor.numpy()
+            
+            # 终极修复 3：不论上游传来的是 [B, H, W], [H, W] 还是 [B, 1, H, W]，暴击降维只拿 2D 数组
+            while mask_np.ndim > 2:
+                mask_np = mask_np[0]
+                
             mask_np = cv2.resize(mask_np, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_NEAREST)
             
-            # 我们需要的是背景（mask < 0.5 的地方），生成一个布尔索引
-            # ignore_mask: 1=Clothes(Ignore), 0=Background(Keep)
-            # 我们需要计算 stats 的区域是 mask < 0.5
+            # 兼容各种变态的 Mask 数值范围（0-255 或 0.0-1.0）
+            if mask_np.max() > 2.0:
+                mask_np = mask_np / 255.0
+            
             valid_pixels_bool = mask_np < 0.5
         else:
-            # 如果没 mask，就用全图计算（回退到普通模式）
             valid_pixels_bool = np.ones((gen_np.shape[0], gen_np.shape[1]), dtype=bool)
 
         # 3. 转换到 LAB 空间
         ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
         gen_lab = cv2.cvtColor(gen_np, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-        # 4. 核心算法：只在 Mask 允许的区域计算 Mean/Std
-        # 提取有效像素
+        # 4. 核心算法提取
         ref_valid = ref_lab[valid_pixels_bool]
         gen_valid = gen_lab[valid_pixels_bool]
 
-        # 如果 mask 覆盖了全图，导致没有有效像素，防报错
-        if len(ref_valid) == 0 or len(gen_valid) == 0:
-            print("Warning: Mask covers entire image, using global stats.")
-            ref_valid = ref_lab
-            gen_valid = gen_lab
+        # 验证提取是否成功，如果提取的有效像素太少，说明遮罩失效，给出明显警告
+        if len(ref_valid) < 100 or len(gen_valid) < 100:
+            print("===================================================")
+            print("[SmartColorMatch WARNING] MASK 读取失效或覆盖了全图！")
+            print("正在回退为全局统计，这大概率会导致画面的肤色严重偏蓝/偏色！")
+            print("===================================================")
+            ref_valid = ref_lab.reshape(-1, 3)
+            gen_valid = gen_lab.reshape(-1, 3)
+        else:
+            ref_valid = ref_valid.reshape(-1, 3)
+            gen_valid = gen_valid.reshape(-1, 3)
 
-        # 计算统计量 (Mean, Std)
-        # l, a, b
         r_mean = np.mean(ref_valid, axis=0)
         r_std  = np.std(ref_valid, axis=0) + 1e-5
         
         g_mean = np.mean(gen_valid, axis=0)
         g_std  = np.std(gen_valid, axis=0) + 1e-5
-
-        # 5. 应用颜色迁移到【全图】 (即使是衣服区域也要应用这个色偏修正)
-        # 这样背景修正了，衣服也会跟着修正色温，融合更自然
         
         res_lab = gen_lab.copy()
 
         if method == "reinhard_lab":
-            # Reinhard 算法: (x - mean_src) * (std_trg / std_src) + mean_trg
-            # 只修正 A 和 B 通道 (色相/饱和度)，保留 L 通道 (亮度/光影)
-            # 除非你想连亮度也统一，否则建议只做 idx 1 和 2
-            
-            # 这里我做一个优化：亮度通道通常不需要完全匹配 Std，只需匹配 Mean (白平衡) 
-            # 或者完全保留生成图的 L (更安全)
-            # 针对你的需求“整体一致”，建议修正 A/B 通道，L 通道保持原样或微调
-            
-            for i in [1, 2]: # 1=A, 2=B
+            for i in [1, 2]: 
                 res_lab[:,:,i] = (gen_lab[:,:,i] - g_mean[i]) * (r_std[i] / g_std[i]) + r_mean[i]
-            
-            # L 通道通常不动，或者只进行非常微弱的直方图对齐，这里为了换装光影自然，不动 L
-            # res_lab[:,:,0] = gen_lab[:,:,0] 
-
         elif method == "mkl_neutral":
-            # 另一种算法，仅对齐均值（White Balance），不拉伸对比度
-            # 这种方法对于色差修复非常稳，不会产生怪异的饱和度
             for i in [1, 2]:
                 res_lab[:,:,i] = (gen_lab[:,:,i] - g_mean[i]) + r_mean[i]
 
-        # 6. 限制范围并转回 RGB
         res_lab = np.clip(res_lab, 0, 255)
         res_rgb = cv2.cvtColor(res_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
 
-        # 7. Blend (与原生成图混合，控制强度)
         final_rgb = (res_rgb * blend_factor + gen_np * (1 - blend_factor)).astype(np.uint8)
 
-        # 转回 Tensor
-        img_out = torch.from_numpy(final_rgb).float() / 255.0
-        img_out = img_out.unsqueeze(0) # [1, H, W, C]
+        # 输出前再次转回标准的 PyTorch float32
+        img_out = torch.from_numpy(final_rgb).to(torch.float32) / 255.0
+        img_out = img_out.unsqueeze(0) 
 
         return (img_out,)
 
