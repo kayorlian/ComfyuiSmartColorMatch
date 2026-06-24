@@ -14,6 +14,8 @@ class SmartColorMatch:
                 "image_gen": ("IMAGE",),  # 生成图
                 "method": (["mkl_neutral", "reinhard_lab"],), # 算法选择
                 "blend_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                # 新增：通道翻转修复开关，默认设定为 True (开启)
+                "fix_bgr": ("BOOLEAN", {"default": True, "label_on": "Fix Blue (BGR2RGB)", "label_off": "Normal"}),
             },
             "optional": {
                 "ignore_mask": ("MASK",), # 衣服的蒙版（指明哪些地方不需要计算颜色统计）
@@ -24,10 +26,16 @@ class SmartColorMatch:
     FUNCTION = "match_color"
     CATEGORY = "Image/Color"
 
-    def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
+    def match_color(self, image_ref, image_gen, method, blend_factor, fix_bgr=True, ignore_mask=None):
         # 1. ComfyUI 的图片是 Tensor [B, H, W, C] 范围 0-1，转为 Numpy [H, W, C] 范围 0-255
         ref_np = (image_ref[0].cpu().numpy() * 255).astype(np.uint8)
         gen_np = (image_gen[0].cpu().numpy() * 255).astype(np.uint8)
+
+        # --- 新增：BGR 转 RGB 的核心修复逻辑 ---
+        if fix_bgr:
+            # 使用 numpy 切片 [:, :, ::-1] 极速倒序第三维度，把 BGR 强行转回 RGB
+            gen_np = gen_np[:, :, ::-1]
+        # --------------------------------------
 
         # 确保尺寸一致，如果不一致，将 ref 缩放到 gen 的大小
         if ref_np.shape != gen_np.shape:
