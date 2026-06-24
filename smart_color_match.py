@@ -14,6 +14,9 @@ class SmartColorMatch:
                 "image_gen": ("IMAGE",),  
                 "method": (["mkl_neutral", "reinhard_lab"],), 
                 "blend_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "invert_mask": (["false", "true"], {"default": "false"}),
+                # 🌟 新增：透视调试模式。如果依然颜色不对，打开它，你能亲眼看到算法提取了什么部分！
+                "debug_view": (["false", "true"], {"default": "false"}),
             },
             "optional": {
                 "ignore_mask": ("MASK",), 
@@ -24,61 +27,67 @@ class SmartColorMatch:
     FUNCTION = "match_color"
     CATEGORY = "Image/Color"
 
-    def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
-        # 1. 终极修复：强制转换为标准的 float32，彻底杜绝 PyTorch 2.9+ 中的 bfloat16/float16 导致的 numpy 乱码崩溃
-        ref_tensor = image_ref.to(torch.float32).cpu()
-        gen_tensor = image_gen.to(torch.float32).cpu()
-        
-        # 确保只取第一帧 (降维提取)
-        if ref_tensor.ndim == 4: ref_tensor = ref_tensor[0]
-        if gen_tensor.ndim == 4: gen_tensor = gen_tensor[0]
+    # 🛡️ 防弹级图像提取器
+    def _extract_image(self, tensor):
+        t = tensor.cpu().float()
+        if t.ndim == 4: t = t[0] # 取第一帧 [H, W, C] 或 [C, H, W]
+        # 修复 PyTorch 2.9+ 某些节点输出通道前置 [C, H, W] 的致命 Bug
+        if t.shape[0] in [1, 3, 4] and t.shape[-1] > 4: 
+            t = t.permute(1, 2, 0)
+        # 强制整理内存布局，防止 Numpy 读出乱码
+        t = t.contiguous().numpy()
+        # 强行剥离透明通道
+        if t.shape[-1] > 3: t = t[..., :3]
+        return (t * 255.0).clip(0, 255).astype(np.uint8)
 
-        # 安全转为 Numpy uint8
-        ref_np = (ref_tensor.numpy() * 255).clip(0, 255).astype(np.uint8)
-        gen_np = (gen_tensor.numpy() * 255).clip(0, 255).astype(np.uint8)
-        
-        # 终极修复 2：如果新版 ComfyUI 传来了带透明度 (RGBA) 的 4 通道图，强行丢弃 Alpha 通道，只留 RGB
-        if ref_np.shape[-1] > 3: ref_np = ref_np[..., :3]
-        if gen_np.shape[-1] > 3: gen_np = gen_np[..., :3]
+    # 🛡️ 防弹级遮罩提取器
+    def _extract_mask(self, tensor):
+        t = tensor.cpu().float().squeeze() # 暴击降维，把 [1, H, W, 1] 压扁
+        if t.ndim == 3: t = t[0]
+        return t.contiguous().numpy()
+
+    def match_color(self, image_ref, image_gen, method, blend_factor, invert_mask="false", debug_view="false", ignore_mask=None):
+        ref_np = self._extract_image(image_ref)
+        gen_np = self._extract_image(image_gen)
 
         if ref_np.shape != gen_np.shape:
             ref_np = cv2.resize(ref_np, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_AREA)
 
-        # 2. 处理 Mask
-        valid_mask = None
+        valid_pixels_bool = None
         if ignore_mask is not None:
-            # 同样强制 float32，保住 Mask 的数据纯洁性
-            mask_tensor = ignore_mask.to(torch.float32).cpu()
-            mask_np = mask_tensor.numpy()
-            
-            # 终极修复 3：不论上游传来的是 [B, H, W], [H, W] 还是 [B, 1, H, W]，暴击降维只拿 2D 数组
-            while mask_np.ndim > 2:
-                mask_np = mask_np[0]
-                
+            mask_np = self._extract_mask(ignore_mask)
             mask_np = cv2.resize(mask_np, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_NEAREST)
             
-            # 兼容各种变态的 Mask 数值范围（0-255 或 0.0-1.0）
             if mask_np.max() > 2.0:
                 mask_np = mask_np / 255.0
-            
+                
+            # 🛡️ 核心修复：红裙子防渗漏。强行把衣服遮罩向外膨胀15个像素，确保背景统计时绝对碰不到红裙子的边缘！
+            kernel = np.ones((15, 15), np.uint8)
+            mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+
+            if invert_mask == "true":
+                mask_np = 1.0 - mask_np
+                
             valid_pixels_bool = mask_np < 0.5
         else:
             valid_pixels_bool = np.ones((gen_np.shape[0], gen_np.shape[1]), dtype=bool)
 
-        # 3. 转换到 LAB 空间
+        # 🌟 调试模式：直接把算法提取的“背景”给你看！
+        if debug_view == "true":
+            debug_img = gen_np.copy()
+            # 把算法【不处理】的衣服部分涂成瞎眼的亮绿色
+            debug_img[~valid_pixels_bool] = [0, 255, 0] 
+            img_out = torch.from_numpy(debug_img).to(torch.float32) / 255.0
+            return (img_out.unsqueeze(0),)
+
         ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
         gen_lab = cv2.cvtColor(gen_np, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-        # 4. 核心算法提取
         ref_valid = ref_lab[valid_pixels_bool]
         gen_valid = gen_lab[valid_pixels_bool]
 
-        # 验证提取是否成功，如果提取的有效像素太少，说明遮罩失效，给出明显警告
         if len(ref_valid) < 100 or len(gen_valid) < 100:
-            print("===================================================")
-            print("[SmartColorMatch WARNING] MASK 读取失效或覆盖了全图！")
-            print("正在回退为全局统计，这大概率会导致画面的肤色严重偏蓝/偏色！")
-            print("===================================================")
+            print("==== [SmartColorMatch 警告] 遮罩失效，回退全局统计 ====")
             ref_valid = ref_lab.reshape(-1, 3)
             gen_valid = gen_lab.reshape(-1, 3)
         else:
@@ -87,7 +96,6 @@ class SmartColorMatch:
 
         r_mean = np.mean(ref_valid, axis=0)
         r_std  = np.std(ref_valid, axis=0) + 1e-5
-        
         g_mean = np.mean(gen_valid, axis=0)
         g_std  = np.std(gen_valid, axis=0) + 1e-5
         
@@ -105,7 +113,6 @@ class SmartColorMatch:
 
         final_rgb = (res_rgb * blend_factor + gen_np * (1 - blend_factor)).astype(np.uint8)
 
-        # 输出前再次转回标准的 PyTorch float32
         img_out = torch.from_numpy(final_rgb).to(torch.float32) / 255.0
         img_out = img_out.unsqueeze(0) 
 
