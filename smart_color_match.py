@@ -124,7 +124,7 @@ class SmartColorMatchAdvanced:
         final_lab = corrected_low + gen_lab_high
 
         # 9. 转换回 RGB 并处理溢出边界
-        final_lab = np.clip(final_lab, [0, -128, -128], [100, 127, 127])
+        final_lab = np.clip(final_lab, [0, -128, -128], [100, 127, 127]).astype(np.float32)
         res_rgb = cv2.cvtColor(final_lab, cv2.COLOR_LAB2RGB)
         res_rgb = np.clip(res_rgb, 0.0, 1.0)
 
