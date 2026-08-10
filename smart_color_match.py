@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import cv2
 
-class SmartColorMatch:
+class SmartColorMatchAdvanced:
     def __init__(self):
         pass
 
@@ -10,146 +10,136 @@ class SmartColorMatch:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image_ref": ("IMAGE",),  # 参考图 [B, H, W, C]
-                "image_gen": ("IMAGE",),  # 生成图 [B, H, W, C]
-                "method": (["mkl_neutral", "reinhard_lab"],),
+                "image_ref": ("IMAGE",),  # 原始参考图
+                "image_gen": ("IMAGE",),  # 4K 生成图 (带偏色)
                 "blend_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                # 新增核心控制参数
+                "freq_separation_radius": ("INT", {"default": 31, "min": 0, "max": 255, "step": 2}), # 高低频分离半径
+                "decontaminate_radius": ("INT", {"default": 15, "min": 0, "max": 100, "step": 1}), # 原图反弹光隔离带宽度
+                "luma_protection": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}), # 高光/阴影保护强度
             },
             "optional": {
-                "ignore_mask": ("MASK",), 
+                "ignore_mask": ("MASK",),  # 1 为服装区(不参与统计)，0 为背景肤色区(参与统计)
             }
         }
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "match_color"
-    CATEGORY = "Image/Color"
+    CATEGORY = "Image/Color Advanced"
 
-    def match_color(self, image_ref, image_gen, method, blend_factor, ignore_mask=None):
-        batch_size = image_gen.shape[0]
-        ref_batch_size = image_ref.shape[0]
+    def calculate_weighted_stats(self, image_lab, mask):
+        """计算带权重的均值和方差，支持渐变 Mask"""
+        mask_expanded = np.expand_dims(mask, axis=-1)
+        sum_mask = np.sum(mask_expanded)
         
-        out_tensors = []
+        if sum_mask < 1e-5:
+            return np.zeros(3), np.ones(3)
 
-        mask_np_batch = None
+        # 加权均值
+        mean = np.sum(image_lab * mask_expanded, axis=(0, 1)) / sum_mask
+        
+        # 加权方差
+        variance = np.sum(((image_lab - mean) ** 2) * mask_expanded, axis=(0, 1)) / sum_mask
+        std = np.sqrt(variance) + 1e-5
+        
+        return mean, std
+
+    def match_color(self, image_ref, image_gen, blend_factor, freq_separation_radius, decontaminate_radius, luma_protection, ignore_mask=None):
+        # 1. 提取 Tensor 到 Numpy (全程保持 float32)
+        ref_np = image_ref[0].cpu().numpy()
+        gen_np = image_gen[0].cpu().numpy()
+
+        # 2. 处理 Mask (不再做二值化一刀切，保留羽化过渡区)
+        ref_mask = np.ones((ref_np.shape[0], ref_np.shape[1]), dtype=np.float32)
+        gen_mask = np.ones((gen_np.shape[0], gen_np.shape[1]), dtype=np.float32)
+
         if ignore_mask is not None:
-            mask_np_batch = ignore_mask.cpu().numpy()
-            if mask_np_batch.ndim == 2:
-                mask_np_batch = mask_np_batch[np.newaxis, ...]
-
-        for i in range(batch_size):
-            curr_ref_img = image_ref[i % ref_batch_size].cpu().numpy()
-            curr_gen_img = image_gen[i].cpu().numpy()
-
-            # ==========================================================
-            # [核心终极修复 1]：拦截 VAE 越界值，防止 OpenCV 计算崩溃产生 NaN 噪点
-            # ==========================================================
-            curr_ref_img = np.clip(curr_ref_img, 0.0, 1.0)
-            curr_gen_img = np.clip(curr_gen_img, 0.0, 1.0)
-
-            # 使用 INTER_AREA 避免缩小产生的摩尔纹
-            if curr_ref_img.shape[:2] != curr_gen_img.shape[:2]:
-                curr_ref_img = cv2.resize(curr_ref_img, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_AREA)
-
-            # ==========================================================
-            # [新增修复]：动态检测并排除参考图的黑边 (黑边通常 RGB 值接近 0)
-            # 计算 RGB 颜色之和，如果极小 (< 0.05) 则认为是黑边，不参与颜色统计
-            # ==========================================================
-            ref_non_black_mask = np.sum(curr_ref_img, axis=-1) > 0.05
-
-            # 屏蔽遮罩逻辑（保持你原有的逻辑）
-            valid_pixels_bool = None
-            if mask_np_batch is not None:
-                curr_mask = mask_np_batch[i % mask_np_batch.shape[0]]
-                if curr_mask.shape != curr_gen_img.shape[:2]:
-                    curr_mask = cv2.resize(curr_mask, (curr_gen_img.shape[1], curr_gen_img.shape[0]), interpolation=cv2.INTER_LINEAR)
-                valid_pixels_bool = curr_mask < 0.5
-
-            ref_lab = cv2.cvtColor(curr_ref_img, cv2.COLOR_RGB2LAB)
-            gen_lab = cv2.cvtColor(curr_gen_img, cv2.COLOR_RGB2LAB)
-
-            # 结合黑边遮罩和输入的 ignore_mask
-            if valid_pixels_bool is not None:
-                # 参考图需要同时满足 valid_pixels_bool 并且 不是黑边
-                ref_combined_mask = valid_pixels_bool & ref_non_black_mask
-                ref_valid = ref_lab[ref_combined_mask]
-                gen_valid = gen_lab[valid_pixels_bool]
+            raw_mask = ignore_mask.cpu().numpy()
+            if raw_mask.ndim == 3: 
+                raw_mask = raw_mask[0]
+            
+            # 权重反转：需要的是背景/肤色 (mask 越小，权重越高)
+            raw_mask_inv = np.clip(1.0 - raw_mask, 0.0, 1.0)
+            
+            # 分别对齐尺寸 (空间解耦，只 Resize Mask，不 Resize 图片)
+            gen_mask = cv2.resize(raw_mask_inv, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            ref_mask_raw = cv2.resize(raw_mask_inv, (ref_np.shape[1], ref_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            
+            # 反弹光物理剥离 (De-contamination)
+            if decontaminate_radius > 0:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (decontaminate_radius, decontaminate_radius))
+                # 腐蚀背景 Mask（等同于膨胀衣服区），避开服装交界处的环境光污染
+                ref_mask = cv2.erode(ref_mask_raw, kernel, iterations=1)
             else:
-                # 如果没有输入 ignore_mask，仅排除参考图的黑边
-                ref_valid = ref_lab[ref_non_black_mask]
-                gen_valid = gen_lab.reshape(-1, 3)
+                ref_mask = ref_mask_raw
 
-            # 兜底：防止 mask 异常导致没有有效像素
-            if ref_valid.size == 0 or gen_valid.size == 0:
-                ref_valid = ref_lab.reshape(-1, 3)
-                gen_valid = gen_lab.reshape(-1, 3)
+        # 3. 转换到 LAB 色彩空间 (Float32 避免断层)
+        ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+        gen_lab = cv2.cvtColor(gen_np, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-            # 提取中位数主色调
-            r_mean = np.median(ref_valid, axis=0)
-            g_mean = np.median(gen_valid, axis=0)
-            
-            r_std  = np.std(ref_valid, axis=0) + 1e-6 
-            g_std  = np.std(gen_valid, axis=0) + 1e-6
-
-            l_channel = gen_lab[:, :, 0]
-            ab_channels = gen_lab[:, :, 1:]
-
-            # 基础颜色偏移限制
-            mean_shift = r_mean[1:] - g_mean[1:]
-            mean_shift = np.clip(mean_shift, -15.0, 15.0)
-
-            l_shift = r_mean[0] - g_mean[0]
-            l_shift = np.clip(l_shift, -20.0, 20.0)
-
-            if method == "reinhard_lab":
-                scale = r_std[1:] / g_std[1:]
-                scale = np.clip(scale, 0.5, 1.5)
-                ab_channels -= g_mean[1:]
-                ab_channels *= scale
-                ab_channels += (g_mean[1:] + mean_shift)
-                l_channel += (l_shift * 0.5) 
-                
-            elif method == "mkl_neutral":
-                ab_channels += mean_shift
-                l_channel += (l_shift * 0.5) 
-
-            # ==========================================================
-            # [核心终极修复 2]：拦截 LAB 通道越界，防止 LAB2RGB 输出垃圾颜色
-            # Float32 模式下，L 必须在 0~100，ab 必须在 -127~127 之间
-            # ==========================================================
-            gen_lab[:, :, 0] = np.clip(l_channel, 0.0, 100.0)
-            gen_lab[:, :, 1] = np.clip(ab_channels[:, :, 0], -127.0, 127.0)
-            gen_lab[:, :, 2] = np.clip(ab_channels[:, :, 1], -127.0, 127.0)
-
-            # 6. 转回 RGB
-            res_rgb = cv2.cvtColor(gen_lab, cv2.COLOR_LAB2RGB)
-            
-            # 等比例缩放保护色相，避免生硬截断 (Gamut Mapping)
-            max_c = np.max(res_rgb, axis=2, keepdims=True)
-            max_c = np.where(max_c <= 0, 1.0, max_c) # 防止除以0或负数崩溃
-            res_rgb = np.where(max_c > 1.0, res_rgb / max_c, res_rgb)
-            
-            # 最后安全封底
-            res_rgb = np.clip(res_rgb, 0.0, 1.0)
-            
-            # 7. 混合 (Blend)
-            if blend_factor < 1.0:
-                res_rgb = res_rgb * blend_factor + curr_gen_img * (1 - blend_factor)
-                res_rgb = np.clip(res_rgb, 0.0, 1.0)
-
-            img_tensor = torch.from_numpy(res_rgb)
-            out_tensors.append(img_tensor)
-
-        if len(out_tensors) > 0:
-            final_output = torch.stack(out_tensors, dim=0)
+        # 4. 高低频分离 (Frequency Separation)
+        if freq_separation_radius > 0:
+            k_size = freq_separation_radius if freq_separation_radius % 2 == 1 else freq_separation_radius + 1
+            gen_lab_low = cv2.GaussianBlur(gen_lab, (k_size, k_size), 0)
+            gen_lab_high = gen_lab - gen_lab_low
         else:
-            final_output = image_gen
+            gen_lab_low = gen_lab
+            gen_lab_high = np.zeros_like(gen_lab)
 
-        return (final_output,)
+        # 5. 基于掩膜独立计算目标与源的统计量 (消除空间暴力缩放)
+        ref_mean, ref_std = self.calculate_weighted_stats(ref_lab, ref_mask)
+        gen_mean, gen_std = self.calculate_weighted_stats(gen_lab_low, gen_mask)
+
+        # 6. 色偏修复运算 (仅在低频层)
+        corrected_low = np.copy(gen_lab_low)
+        
+        # 色相/饱和度偏移量 (A/B 通道)
+        delta_a = ref_mean[1] - gen_mean[1]
+        delta_b = ref_mean[2] - gen_mean[2]
+        # L 通道均值极弱拉扯 (修复全局发灰，同时不破坏立体感)
+        delta_l = (ref_mean[0] - gen_mean[0]) * 0.3 
+
+        # 7. 高光与阴影动态保护 (Luminance Roll-off)
+        if luma_protection > 0.0:
+            # L 通道范围是 0 到 100
+            l_channel = gen_lab_low[:, :, 0]
+            
+            # 构建抛物线权重: 中间调(50)为1，向0和100平滑衰减
+            # normalized_l: -1 到 1
+            normalized_l = (l_channel - 50.0) / 50.0
+            # weight: 1.0 (中间) -> 0.0 (两端)
+            roll_off_weight = 1.0 - (np.abs(normalized_l) ** (1.0 / luma_protection))
+            roll_off_weight = np.clip(roll_off_weight, 0.0, 1.0)
+            roll_off_weight = np.expand_dims(roll_off_weight, axis=-1)
+            
+            # 应用带保护的偏移
+            shifts = np.array([delta_l, delta_a, delta_b])
+            corrected_low += shifts * roll_off_weight
+        else:
+            corrected_low[:, :, 0] += delta_l
+            corrected_low[:, :, 1] += delta_a
+            corrected_low[:, :, 2] += delta_b
+
+        # 8. 频域重组：加回高频细节层
+        final_lab = corrected_low + gen_lab_high
+
+        # 9. 转换回 RGB 并处理溢出边界
+        final_lab = np.clip(final_lab, [0, -128, -128], [100, 127, 127]).astype(np.float32)
+        res_rgb = cv2.cvtColor(final_lab, cv2.COLOR_LAB2RGB)
+        res_rgb = np.clip(res_rgb, 0.0, 1.0)
+
+        # 10. 全局混合控制 (Blend)
+        final_rgb = res_rgb * blend_factor + gen_np * (1.0 - blend_factor)
+
+        # 返回 Tensor [1, H, W, C]
+        img_out = torch.from_numpy(final_rgb).unsqueeze(0).float()
+
+        return (img_out,)
 
 NODE_CLASS_MAPPINGS = {
-    "SmartColorMatch": SmartColorMatch
+    "SmartColorMatchAdvanced": SmartColorMatchAdvanced
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SmartColorMatch": "Smart Color Match (Fixed)"
+    "SmartColorMatchAdvanced": "Smart Color Match (Ultimate VTON)"
 }
