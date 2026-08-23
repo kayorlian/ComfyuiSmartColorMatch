@@ -28,18 +28,8 @@ class SmartColorMatchAdvanced:
     CATEGORY = "Image/Color Advanced"
 
     def calculate_weighted_stats(self, image_lab, mask):
-        """计算带权重的均值和方差，支持渐变 Mask，并自动过滤纯白填充区"""
-        # --- 新增逻辑：过滤纯白/极亮像素 ---
-        # LAB 颜色空间中，L 通道索引为 0，范围是 0 到 100。
-        # 这里排除 L 值大于 95 的像素，避免纯白填充区拉高整体亮度均值。
-        l_channel = image_lab[:, :, 0]
-        non_white_mask = (l_channel <= 95.0).astype(np.float32)
-        
-        # 将原始 mask 与 非纯白 mask 相乘，得到最终的有效遮罩
-        effective_mask = mask * non_white_mask
-        # --- 新增逻辑结束 ---
-        
-        mask_expanded = np.expand_dims(effective_mask, axis=-1)
+        """计算带权重的均值和方差，支持渐变 Mask"""
+        mask_expanded = np.expand_dims(mask, axis=-1)
         sum_mask = np.sum(mask_expanded)
         
         if sum_mask < 1e-5:
@@ -55,13 +45,23 @@ class SmartColorMatchAdvanced:
         return mean, std
 
     def match_color(self, image_ref, image_gen, blend_factor, freq_separation_radius, decontaminate_radius, luma_protection, ignore_mask=None):
-        # 1. 提取 Tensor 到 Numpy (全程保持 float32)
+        # 1. 提取 Tensor 到 Numpy (全程保持 float32, ComfyUI 中像素值范围为 0.0 ~ 1.0)
         ref_np = image_ref[0].cpu().numpy()
         gen_np = image_gen[0].cpu().numpy()
 
+        # --- 新增核心逻辑：精准定位纯白像素 (RGB 255, 255, 255 即 1.0, 1.0, 1.0) ---
+        # 使用 > 0.99 匹配纯白，以防浮点数精度误差。np.all 确保 R, G, B 三个通道都满足条件。
+        ref_is_white = np.all(ref_np > 0.99, axis=-1).astype(np.float32)
+        gen_is_white = np.all(gen_np > 0.99, axis=-1).astype(np.float32)
+        
+        # 反转：1 代表非白（有效像素），0 代表纯白（需过滤的像素）
+        ref_valid_pixels = 1.0 - ref_is_white
+        gen_valid_pixels = 1.0 - gen_is_white
+        # -----------------------------------------------------------------------
+
         # 2. 处理 Mask (不再做二值化一刀切，保留羽化过渡区)
-        ref_mask = np.ones((ref_np.shape[0], ref_np.shape[1]), dtype=np.float32)
-        gen_mask = np.ones((gen_np.shape[0], gen_np.shape[1]), dtype=np.float32)
+        ref_mask = np.copy(ref_valid_pixels)
+        gen_mask = np.copy(gen_valid_pixels)
 
         if ignore_mask is not None:
             raw_mask = ignore_mask.cpu().numpy()
@@ -72,16 +72,18 @@ class SmartColorMatchAdvanced:
             raw_mask_inv = np.clip(1.0 - raw_mask, 0.0, 1.0)
             
             # 分别对齐尺寸 (空间解耦，只 Resize Mask，不 Resize 图片)
-            gen_mask = cv2.resize(raw_mask_inv, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_LINEAR)
-            ref_mask_raw = cv2.resize(raw_mask_inv, (ref_np.shape[1], ref_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            gen_mask_base = cv2.resize(raw_mask_inv, (gen_np.shape[1], gen_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            ref_mask_base = cv2.resize(raw_mask_inv, (ref_np.shape[1], ref_np.shape[0]), interpolation=cv2.INTER_LINEAR)
             
             # 反弹光物理剥离 (De-contamination)
             if decontaminate_radius > 0:
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (decontaminate_radius, decontaminate_radius))
                 # 腐蚀背景 Mask（等同于膨胀衣服区），避开服装交界处的环境光污染
-                ref_mask = cv2.erode(ref_mask_raw, kernel, iterations=1)
-            else:
-                ref_mask = ref_mask_raw
+                ref_mask_base = cv2.erode(ref_mask_base, kernel, iterations=1)
+            
+            # 将用户输入的遮罩与“非白像素”遮罩正片叠底（相乘）
+            ref_mask = ref_mask_base * ref_valid_pixels
+            gen_mask = gen_mask_base * gen_valid_pixels
 
         # 3. 转换到 LAB 色彩空间 (Float32 避免断层)
         ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -96,7 +98,7 @@ class SmartColorMatchAdvanced:
             gen_lab_low = gen_lab
             gen_lab_high = np.zeros_like(gen_lab)
 
-        # 5. 基于掩膜独立计算目标与源的统计量 (消除空间暴力缩放)
+        # 5. 基于掩膜独立计算目标与源的统计量 (消除空间暴力缩放，并自动忽略纯白)
         ref_mean, ref_std = self.calculate_weighted_stats(ref_lab, ref_mask)
         gen_mean, gen_std = self.calculate_weighted_stats(gen_lab_low, gen_mask)
 
