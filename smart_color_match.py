@@ -28,8 +28,18 @@ class SmartColorMatchAdvanced:
     CATEGORY = "Image/Color Advanced"
 
     def calculate_weighted_stats(self, image_lab, mask):
-        """计算带权重的均值和方差，支持渐变 Mask"""
-        mask_expanded = np.expand_dims(mask, axis=-1)
+        """计算带权重的均值和方差，支持渐变 Mask，并自动过滤纯白填充区"""
+        # --- 新增逻辑：过滤纯白/极亮像素 ---
+        # LAB 颜色空间中，L 通道索引为 0，范围是 0 到 100。
+        # 这里排除 L 值大于 95 的像素，避免纯白填充区拉高整体亮度均值。
+        l_channel = image_lab[:, :, 0]
+        non_white_mask = (l_channel <= 95.0).astype(np.float32)
+        
+        # 将原始 mask 与 非纯白 mask 相乘，得到最终的有效遮罩
+        effective_mask = mask * non_white_mask
+        # --- 新增逻辑结束 ---
+        
+        mask_expanded = np.expand_dims(effective_mask, axis=-1)
         sum_mask = np.sum(mask_expanded)
         
         if sum_mask < 1e-5:
