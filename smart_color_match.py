@@ -102,37 +102,38 @@ class SmartColorMatchAdvanced:
         ref_mean, ref_std = self.calculate_weighted_stats(ref_lab, ref_mask)
         gen_mean, gen_std = self.calculate_weighted_stats(gen_lab_low, gen_mask)
 
-        # 6. 色偏修复运算 (仅在低频层)
+        # 6. 色偏修复运算 (引入标准差缩放，实现完整的 Reinhard 色彩迁移)
         corrected_low = np.copy(gen_lab_low)
         
-        # 色相/饱和度偏移量 (A/B 通道)
-        delta_a = ref_mean[1] - gen_mean[1]
-        delta_b = ref_mean[2] - gen_mean[2]
-        # L 通道均值极弱拉扯 (修复全局发灰，同时不破坏立体感)
-        delta_l = (ref_mean[0] - gen_mean[0]) * 0.3 
+        # 计算标准差缩放比例 (限制缩放阈值以防极端噪点过度放大)
+        ratio_l = np.clip(ref_std[0] / gen_std[0], 0.5, 2.0)
+        ratio_a = np.clip(ref_std[1] / gen_std[1], 0.5, 2.0)
+        ratio_b = np.clip(ref_std[2] / gen_std[2], 0.5, 2.0)
 
         # 7. 高光与阴影动态保护 (Luminance Roll-off)
         if luma_protection > 0.0:
-            # L 通道范围是 0 到 100
             l_channel = gen_lab_low[:, :, 0]
-            
-            # 构建抛物线权重: 中间调(50)为1，向0和100平滑衰减
-            # normalized_l: -1 到 1
             normalized_l = (l_channel - 50.0) / 50.0
-            # weight: 1.0 (中间) -> 0.0 (两端)
             roll_off_weight = 1.0 - (np.abs(normalized_l) ** (1.0 / luma_protection))
             roll_off_weight = np.clip(roll_off_weight, 0.0, 1.0)
             roll_off_weight = np.expand_dims(roll_off_weight, axis=-1)
             
-            # 应用带保护的偏移
-            shifts = np.array([delta_l, delta_a, delta_b])
-            corrected_low += shifts * roll_off_weight
+            # 使用均值平移和标准差缩放，并结合保护权重
+            # L 通道极弱拉扯 (0.3 权重保持画面原有光影立体感)
+            corrected_low[:, :, 0] = (gen_lab_low[:, :, 0] - gen_mean[0]) * (1.0 + (ratio_l - 1.0) * roll_off_weight[:, :, 0]) + gen_mean[0] + (ref_mean[0] - gen_mean[0]) * 0.3 * roll_off_weight[:, :, 0]
+            
+            # A, B 通道执行完整映射
+            corrected_low[:, :, 1] = (gen_lab_low[:, :, 1] - gen_mean[1]) * (1.0 + (ratio_a - 1.0) * roll_off_weight[:, :, 0]) + gen_mean[1] + (ref_mean[1] - gen_mean[1]) * roll_off_weight[:, :, 0]
+            corrected_low[:, :, 2] = (gen_lab_low[:, :, 2] - gen_mean[2]) * (1.0 + (ratio_b - 1.0) * roll_off_weight[:, :, 0]) + gen_mean[2] + (ref_mean[2] - gen_mean[2]) * roll_off_weight[:, :, 0]
         else:
-            corrected_low[:, :, 0] += delta_l
-            corrected_low[:, :, 1] += delta_a
-            corrected_low[:, :, 2] += delta_b
+            # 无保护模式：标准的 Reinhard 映射
+            corrected_low[:, :, 0] = (gen_lab_low[:, :, 0] - gen_mean[0]) * ratio_l + gen_mean[0] + (ref_mean[0] - gen_mean[0]) * 0.3
+            corrected_low[:, :, 1] = (gen_lab_low[:, :, 1] - gen_mean[1]) * ratio_a + ref_mean[1]
+            corrected_low[:, :, 2] = (gen_lab_low[:, :, 2] - gen_mean[2]) * ratio_b + ref_mean[2]
 
-        # 8. 频域重组：加回高频细节层
+        # 8. 频域重组：对高频层同步进行色度方差缩放，彻底消除残留在纹理中的紫偏噪点
+        gen_lab_high[:, :, 1] *= ratio_a
+        gen_lab_high[:, :, 2] *= ratio_b
         final_lab = corrected_low + gen_lab_high
 
         # 9. 转换回 RGB 并处理溢出边界
