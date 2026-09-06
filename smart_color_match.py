@@ -102,38 +102,40 @@ class SmartColorMatchAdvanced:
         ref_mean, ref_std = self.calculate_weighted_stats(ref_lab, ref_mask)
         gen_mean, gen_std = self.calculate_weighted_stats(gen_lab_low, gen_mask)
 
-        # 6. 色偏修复运算 (引入标准差缩放，实现完整的 Reinhard 色彩迁移)
+# 6. 色偏修复运算 (回归绝对安全的加法平移)
         corrected_low = np.copy(gen_lab_low)
         
-        # 计算标准差缩放比例 (限制缩放阈值以防极端噪点过度放大)
-        ratio_l = np.clip(ref_std[0] / gen_std[0], 0.5, 2.0)
-        ratio_a = np.clip(ref_std[1] / gen_std[1], 0.5, 2.0)
-        ratio_b = np.clip(ref_std[2] / gen_std[2], 0.5, 2.0)
+        # 计算全局色彩偏移量
+        delta_a = ref_mean[1] - gen_mean[1]
+        delta_b = ref_mean[2] - gen_mean[2]
+        delta_l = (ref_mean[0] - gen_mean[0]) * 0.3 
 
-        # 7. 高光与阴影动态保护 (Luminance Roll-off)
+        # 7. 高光与阴影动态保护 (核心修复：只保护明暗，绝对不限制色彩！)
         if luma_protection > 0.0:
+            # L 通道范围是 0 到 100
             l_channel = gen_lab_low[:, :, 0]
             normalized_l = (l_channel - 50.0) / 50.0
             roll_off_weight = 1.0 - (np.abs(normalized_l) ** (1.0 / luma_protection))
             roll_off_weight = np.clip(roll_off_weight, 0.0, 1.0)
-            roll_off_weight = np.expand_dims(roll_off_weight, axis=-1)
             
-            # 使用均值平移和标准差缩放，并结合保护权重
-            # L 通道极弱拉扯 (0.3 权重保持画面原有光影立体感)
-            corrected_low[:, :, 0] = (gen_lab_low[:, :, 0] - gen_mean[0]) * (1.0 + (ratio_l - 1.0) * roll_off_weight[:, :, 0]) + gen_mean[0] + (ref_mean[0] - gen_mean[0]) * 0.3 * roll_off_weight[:, :, 0]
+            # 【关键修正 1】：亮度保护 (roll_off_weight) 仅作用于 L 通道，维持原图的光影立体感
+            corrected_low[:, :, 0] += delta_l * roll_off_weight
             
-            # A, B 通道执行完整映射
-            corrected_low[:, :, 1] = (gen_lab_low[:, :, 1] - gen_mean[1]) * (1.0 + (ratio_a - 1.0) * roll_off_weight[:, :, 0]) + gen_mean[1] + (ref_mean[1] - gen_mean[1]) * roll_off_weight[:, :, 0]
-            corrected_low[:, :, 2] = (gen_lab_low[:, :, 2] - gen_mean[2]) * (1.0 + (ratio_b - 1.0) * roll_off_weight[:, :, 0]) + gen_mean[2] + (ref_mean[2] - gen_mean[2]) * roll_off_weight[:, :, 0]
+            # 【关键修正 2】：色相/饱和度偏移 (A, B) 必须 100% 全局无死角覆盖！
+            # 无论紫偏藏在多黑的阴影里，都会被这行代码强行拉回正常色系
+            corrected_low[:, :, 1] += delta_a
+            corrected_low[:, :, 2] += delta_b
         else:
-            # 无保护模式：标准的 Reinhard 映射
-            corrected_low[:, :, 0] = (gen_lab_low[:, :, 0] - gen_mean[0]) * ratio_l + gen_mean[0] + (ref_mean[0] - gen_mean[0]) * 0.3
-            corrected_low[:, :, 1] = (gen_lab_low[:, :, 1] - gen_mean[1]) * ratio_a + ref_mean[1]
-            corrected_low[:, :, 2] = (gen_lab_low[:, :, 2] - gen_mean[2]) * ratio_b + ref_mean[2]
+            corrected_low[:, :, 0] += delta_l
+            corrected_low[:, :, 1] += delta_a
+            corrected_low[:, :, 2] += delta_b
 
-        # 8. 频域重组：对高频层同步进行色度方差缩放，彻底消除残留在纹理中的紫偏噪点
-        gen_lab_high[:, :, 1] *= ratio_a
-        gen_lab_high[:, :, 2] *= ratio_b
+        # 8. 频域重组：高频色差过滤 (杀灭 AI 生成的紫色/绿色杂质)
+        # 高频层 (gen_lab_high) 的 L 通道保留了衣料的材质纹理，我们保持不动 (100% 清晰度)
+        # 但高频的 A, B 通道往往藏着 AI 生成的微小紫/绿噪点，我们将其强度削减 50%
+        gen_lab_high[:, :, 1] *= 0.5  
+        gen_lab_high[:, :, 2] *= 0.5  
+        
         final_lab = corrected_low + gen_lab_high
 
         # 9. 转换回 RGB 并处理溢出边界
